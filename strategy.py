@@ -6,12 +6,12 @@ import pandas as pd
 
 class RSIMAStrategy(Strategy):
     # Parameters (tunable for optimization)
-    sma_fast = 50
-    sma_slow = 200
+    sma_fast = 20
+    sma_slow = 50
     rsi_period = 14
-    rsi_overbought = 80
-    rsi_entry_max = 70
-    stop_loss_pct = 0.03  # 3%
+    rsi_overbought = 75
+    rsi_entry_max = 65
+    stop_loss_pct = 0.05  # 5%
 
     def init(self):
         close = pd.Series(self.data.Close)

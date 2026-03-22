@@ -9,9 +9,9 @@ SP500_TICKERS = [
     "META", "BRK-B", "LLY", "AVGO", "TSLA"
 ]
 
-START_DATE = "2018-01-01"
-END_DATE = "2024-12-31"
-INITIAL_CASH = 10_000
+START_DATE = "2023-03-22"
+END_DATE = "2026-03-22"
+INITIAL_CASH = 25_000
 COMMISSION = 0.0035  # IB per-share rate approximated as fraction
 
 
@@ -29,7 +29,7 @@ def run_backtest(ticker: str) -> dict:
         print(f"  Not enough data for {ticker}, skipping.")
         return None
 
-    bt = Backtest(df, RSIMAStrategy, cash=INITIAL_CASH, commission=COMMISSION, exclusive_orders=True)
+    bt = Backtest(df, RSIMAStrategy, cash=INITIAL_CASH, commission=COMMISSION, exclusive_orders=True, finalize_trades=True)
     stats = bt.run()
 
     return {
