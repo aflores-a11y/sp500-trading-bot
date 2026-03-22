@@ -15,7 +15,7 @@ import pandas as pd
 from dateutil.relativedelta import relativedelta
 from options_backtest import (
     SP500_TICKERS, INITIAL_CASH, MAX_TRADE_EXPOSURE_PCT,
-    fetch_all, compute_indicators,
+    fetch_all, fetch_earnings_dates, compute_indicators,
     run_portfolio_backtest, monthly_report,
 )
 
@@ -29,11 +29,11 @@ MC_SIMS       = 5_000
 
 # ── 1. Full Backtest ──────────────────────────────────────────────────────────
 
-def run_full_backtest(ticker_data: dict, indicators: dict) -> dict:
+def run_full_backtest(ticker_data: dict, indicators: dict, earnings_dates: dict = None) -> dict:
     print("\n" + "="*60)
     print("  [1/3] FULL BACKTEST")
     print("="*60)
-    r = run_portfolio_backtest(ticker_data, indicators, verbose=True)
+    r = run_portfolio_backtest(ticker_data, indicators, earnings_dates or {}, verbose=True)
     print(f"  Final Value  : ${r['final_value']:>12,.2f}")
     print(f"  Total Return : {r['total_return']:>+11.2f}%")
     print(f"  Max Drawdown : {r['max_drawdown']:>11.2f}%")
@@ -44,7 +44,7 @@ def run_full_backtest(ticker_data: dict, indicators: dict) -> dict:
 
 # ── 2. Walk-Forward Analysis ──────────────────────────────────────────────────
 
-def run_walk_forward(ticker_data: dict, indicators: dict) -> pd.DataFrame:
+def run_walk_forward(ticker_data: dict, indicators: dict, earnings_dates: dict = None) -> pd.DataFrame:
     print("\n" + "="*60)
     print("  [2/3] WALK-FORWARD ANALYSIS")
     print(f"        Train: {TRAIN_MONTHS}mo | Test: {TEST_MONTHS}mo | Step: {STEP_MONTHS}mo")
@@ -75,9 +75,10 @@ def run_walk_forward(ticker_data: dict, indicators: dict) -> pd.DataFrame:
               f"Train [{tr_s.date()} → {tr_e.date()}] | "
               f"Test  [{tr_e.date()} → {te_e.date()}]")
 
-        train_r = run_portfolio_backtest(ticker_data, indicators,
+        ed = earnings_dates or {}
+        train_r = run_portfolio_backtest(ticker_data, indicators, ed,
                                          start_dt=tr_s, end_dt=tr_e)
-        test_r  = run_portfolio_backtest(ticker_data, indicators,
+        test_r  = run_portfolio_backtest(ticker_data, indicators, ed,
                                          start_dt=tr_e, end_dt=te_e)
 
         print(f"    In-sample  return: {train_r['total_return']:>+8.2f}%  "
@@ -236,11 +237,12 @@ def print_comparison(full_r: dict, wf_df: pd.DataFrame, mc_r: dict):
 
 def main():
     print("Loading data (shared across all analyses)...")
-    ticker_data = fetch_all(SP500_TICKERS)
-    indicators  = {t: compute_indicators(df) for t, df in ticker_data.items()}
+    ticker_data    = fetch_all(SP500_TICKERS)
+    earnings_dates = fetch_earnings_dates(list(ticker_data.keys()))
+    indicators     = {t: compute_indicators(df) for t, df in ticker_data.items()}
 
-    full_r = run_full_backtest(ticker_data, indicators)
-    wf_df  = run_walk_forward(ticker_data, indicators)
+    full_r = run_full_backtest(ticker_data, indicators, earnings_dates)
+    wf_df  = run_walk_forward(ticker_data, indicators, earnings_dates)
     mc_r   = run_monte_carlo(full_r["trades_log"])
 
     print_comparison(full_r, wf_df, mc_r)

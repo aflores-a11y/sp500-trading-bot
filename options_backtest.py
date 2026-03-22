@@ -2,15 +2,18 @@
 Portfolio Options Backtester — 1h candles
 
 Realistic constraints:
-  - IV premium: hist vol × 1.25
-  - Bid/ask spread: $0.15/share on entry & exit
-  - Max total options exposure: 20% of portfolio
-  - Max 2% of portfolio per individual trade
-  - 50% stop-loss on premium paid
-  - IB commission: $0.65/contract
+  - IV premium        : hist vol × 1.25
+  - IV crush          : vol × 0.50 for 6 bars after earnings (collapses overnight)
+  - Earnings blackout : no new entries within 2 days of known earnings
+  - Earnings gap      : bid/ask spread × 3 on bars with >3% overnight price gap
+  - Liquidity cost    : spread scaled by avg hourly volume tier
+  - Bid/ask spread    : $0.15/share base (entry full, exit half)
+  - Max total exposure: 20% of portfolio in options at once
+  - Max per-trade     : 2% of portfolio
+  - Stop-loss         : 50% of premium paid
+  - IB commission     : $0.65/contract
 
-Accepts optional start_dt / end_dt to slice the backtest window,
-allowing walk-forward analysis without re-downloading data.
+Accepts optional start_dt / end_dt for walk-forward slicing.
 """
 
 import yfinance as yf
@@ -42,17 +45,28 @@ MAX_TOTAL_EXPOSURE_PCT  = 0.20
 RISK_FREE_RATE          = 0.05
 OPTION_DTE              = 30
 STOP_LOSS_PCT           = 0.50
-IV_PREMIUM_MULT         = 1.25
-BID_ASK_SPREAD          = 0.15
+COMMISSION_PER_CONTRACT = 0.65
 EMA_FAST                = 12
 EMA_SLOW                = 26
 RSI_PERIOD              = 14
 RSI_OB                  = 70
 RSI_OS                  = 30
-COMMISSION_PER_CONTRACT = 0.65
+
+# ── Realism parameters ────────────────────────────────────────────────────────
+IV_PREMIUM_MULT     = 1.25   # implied vol is ~25% above realized
+IV_CRUSH_MULT       = 0.50   # vol drops 50% right after earnings
+IV_CRUSH_BARS       = 6      # crush lasts ~6 hourly bars (~1 trading day)
+EARNINGS_BLACKOUT   = 2      # skip new entries within N days of earnings
+BASE_SPREAD         = 0.15   # base bid/ask half-spread per share
+GAP_THRESHOLD       = 0.03   # overnight gap > 3% = earnings/news gap
+GAP_SPREAD_MULT     = 3.0    # spread multiplier during gap bars
+LIQ_HIGH_VOL        = 3_000_000   # avg hourly volume above = high liquidity
+LIQ_MED_VOL         = 500_000     # avg hourly volume above = medium liquidity
+LIQ_SPREAD_MED      = 1.5         # spread multiplier for medium liquidity
+LIQ_SPREAD_LOW      = 2.5         # spread multiplier for low liquidity
 
 
-# ── Data ──────────────────────────────────────────────────────────────────────
+# ── Data fetching ─────────────────────────────────────────────────────────────
 
 def fetch_all(tickers: list, batch_size: int = 25) -> dict:
     print(f"Fetching hourly data for {len(tickers)} tickers...")
@@ -79,6 +93,35 @@ def fetch_all(tickers: list, batch_size: int = 25) -> dict:
     return data
 
 
+def fetch_earnings_dates(tickers: list) -> dict:
+    """
+    Returns {ticker: set_of_normalized_dates} for all historical earnings.
+    Gracefully skips tickers where data is unavailable.
+    """
+    print("Fetching earnings dates (IV crush & blackout windows)...")
+    dates = {}
+    for ticker in tickers:
+        try:
+            t  = yf.Ticker(ticker)
+            ed = t.earnings_dates
+            if ed is not None and not ed.empty:
+                normalized = set(
+                    pd.to_datetime(ed.index)
+                    .tz_localize(None if ed.index.tz is None else None, ambiguous="NaT")
+                    .normalize()
+                )
+                dates[ticker] = {d for d in normalized if not pd.isna(d)}
+            else:
+                dates[ticker] = set()
+        except Exception:
+            dates[ticker] = set()
+    found = sum(1 for v in dates.values() if v)
+    print(f"  Earnings dates found for {found}/{len(tickers)} tickers.\n")
+    return dates
+
+
+# ── Indicators ────────────────────────────────────────────────────────────────
+
 def compute_indicators(df: pd.DataFrame) -> pd.DataFrame:
     df = df.copy()
     df["ema_fast"] = df["Close"].ewm(span=EMA_FAST, adjust=False).mean()
@@ -89,44 +132,122 @@ def compute_indicators(df: pd.DataFrame) -> pd.DataFrame:
     loss  = (-delta.clip(upper=0)).rolling(RSI_PERIOD).mean()
     df["rsi"] = 100 - (100 / (1 + gain / loss.replace(0, np.nan)))
 
-    bull = (df["ema_fast"] > df["ema_slow"]) & (df["ema_fast"].shift(1) <= df["ema_slow"].shift(1)) & (df["rsi"] < RSI_OB)
-    bear = (df["ema_fast"] < df["ema_slow"]) & (df["ema_fast"].shift(1) >= df["ema_slow"].shift(1)) & (df["rsi"] > RSI_OS)
+    bull = (df["ema_fast"] > df["ema_slow"]) & \
+           (df["ema_fast"].shift(1) <= df["ema_slow"].shift(1)) & \
+           (df["rsi"] < RSI_OB)
+    bear = (df["ema_fast"] < df["ema_slow"]) & \
+           (df["ema_fast"].shift(1) >= df["ema_slow"].shift(1)) & \
+           (df["rsi"] > RSI_OS)
+
     df["signal"] = 0
     df.loc[bull, "signal"] =  1
     df.loc[bear, "signal"] = -1
+
+    # Flag gap-open bars (>3% overnight gap) for spread widening
+    df["gap"] = (df["Open"] - df["Close"].shift(1)).abs() / df["Close"].shift(1)
     return df.dropna()
 
 
-def get_hist_vol(df: pd.DataFrame, idx: int, window: int = 30) -> float:
-    prices = df["Close"].iloc[max(0, idx - window): idx + 1].values
-    return max(historical_vol(prices, window=min(window, len(prices) - 1)) * IV_PREMIUM_MULT, 0.10)
+# ── Vol & spread helpers ──────────────────────────────────────────────────────
+
+def get_vol(df: pd.DataFrame, idx: int,
+            ticker: str, dt,
+            earnings_dates: dict,
+            pos_entry_dt=None) -> float:
+    """
+    Historical vol with IV premium.
+    Applies IV crush for IV_CRUSH_BARS bars after any earnings date
+    that occurred after the position was entered (or in the last 24h).
+    """
+    prices   = df["Close"].iloc[max(0, idx - 30): idx + 1].values
+    base_vol = max(historical_vol(prices, window=min(30, len(prices) - 1)) * IV_PREMIUM_MULT, 0.10)
+
+    e_dates = earnings_dates.get(ticker, set())
+    if not e_dates:
+        return base_vol
+
+    current_day = pd.Timestamp(dt).tz_localize(None).normalize()
+
+    # Check if any earnings date fell within the last IV_CRUSH_BARS hours
+    for ed in e_dates:
+        try:
+            ed_ts = pd.Timestamp(ed).normalize()
+        except Exception:
+            continue
+        hours_since = (current_day - ed_ts).total_seconds() / 3600
+        if 0 <= hours_since <= IV_CRUSH_BARS:
+            # IV crush: also only apply if position was entered before earnings
+            if pos_entry_dt is None or pd.Timestamp(pos_entry_dt).tz_localize(None).normalize() <= ed_ts:
+                return base_vol * IV_CRUSH_MULT
+
+    return base_vol
+
+
+def get_spread(df: pd.DataFrame, idx: int) -> float:
+    """
+    Effective bid/ask spread per share, combining:
+      - Liquidity tier (based on avg hourly volume)
+      - Gap multiplier (if large overnight gap = earnings/news event)
+    """
+    avg_vol = float(df["Volume"].iloc[max(0, idx - 20): idx + 1].mean())
+
+    if avg_vol >= LIQ_HIGH_VOL:
+        spread = BASE_SPREAD
+    elif avg_vol >= LIQ_MED_VOL:
+        spread = BASE_SPREAD * LIQ_SPREAD_MED
+    else:
+        spread = BASE_SPREAD * LIQ_SPREAD_LOW
+
+    # Widen spread if this is a gap-open bar
+    gap = float(df["gap"].iloc[idx]) if "gap" in df.columns else 0.0
+    if gap >= GAP_THRESHOLD:
+        spread *= GAP_SPREAD_MULT
+
+    return spread
+
+
+def near_earnings(dt, ticker: str, earnings_dates: dict, days: int = EARNINGS_BLACKOUT) -> bool:
+    """Returns True if dt is within `days` calendar days of any known earnings date."""
+    e_dates = earnings_dates.get(ticker, set())
+    current = pd.Timestamp(dt).tz_localize(None).normalize()
+    for ed in e_dates:
+        try:
+            ed_ts = pd.Timestamp(ed).normalize()
+        except Exception:
+            continue
+        if abs((current - ed_ts).days) <= days:
+            return True
+    return False
 
 
 # ── Core backtester ───────────────────────────────────────────────────────────
 
 def run_portfolio_backtest(
-    ticker_data: dict,
-    indicators:  dict,
+    ticker_data:    dict,
+    indicators:     dict,
+    earnings_dates: dict = None,
     start_dt=None,
     end_dt=None,
-    initial_cash: float = INITIAL_CASH,
-    verbose: bool = False,
+    initial_cash:   float = INITIAL_CASH,
+    verbose:        bool  = False,
 ) -> dict:
-    """
-    Run portfolio backtest optionally sliced to [start_dt, end_dt].
-    Indicators always use full history for proper warmup.
-    """
+    if earnings_dates is None:
+        earnings_dates = {}
+
     all_times = sorted(set().union(*[set(df.index) for df in ticker_data.values()]))
 
     if start_dt:
-        start_dt  = pd.Timestamp(start_dt).tz_localize("America/New_York") if start_dt.tzinfo is None else start_dt
-        all_times = [t for t in all_times if t >= start_dt]
+        s = pd.Timestamp(start_dt)
+        if s.tzinfo is None:
+            s = s.tz_localize("America/New_York")
+        all_times = [t for t in all_times if t >= s]
     if end_dt:
-        end_dt    = pd.Timestamp(end_dt).tz_localize("America/New_York") if end_dt.tzinfo is None else end_dt
-        all_times = [t for t in all_times if t <= end_dt]
+        e = pd.Timestamp(end_dt)
+        if e.tzinfo is None:
+            e = e.tz_localize("America/New_York")
+        all_times = [t for t in all_times if t <= e]
 
-    ticker_idx = {t: {dt: i for i, dt in enumerate(df.index)} for t, df in ticker_data.items()}
-
+    ticker_idx   = {t: {dt: i for i, dt in enumerate(df.index)} for t, df in ticker_data.items()}
     cash         = initial_cash
     positions    = []
     trades_log   = []
@@ -137,7 +258,7 @@ def run_portfolio_backtest(
         portfolio_val    = cash + options_exposure
         equity_curve.append({"datetime": dt, "portfolio_value": portfolio_val})
 
-        # ── Mark-to-market ──
+        # ── Mark-to-market open positions ─────────────────────────────────────
         for pos in positions[:]:
             ticker = pos["ticker"]
             idx    = ticker_idx[ticker].get(dt)
@@ -146,36 +267,48 @@ def run_portfolio_backtest(
             df    = ticker_data[ticker]
             price = float(df["Close"].iloc[idx])
             T     = max((pos["expiry"] - dt).total_seconds() / (365 * 24 * 3600), 0)
-            vol   = get_hist_vol(df, idx)
+
+            # Vol with IV crush applied if earnings fell after entry
+            vol    = get_vol(df, idx, ticker, dt, earnings_dates, pos["entry_date"])
+            spread = get_spread(df, idx)
 
             raw = bs_call(price, pos["strike"], T, RISK_FREE_RATE, vol) if pos["type"] == "call" \
                   else bs_put(price, pos["strike"], T, RISK_FREE_RATE, vol)
-            pos["current_value"] = max(raw - BID_ASK_SPREAD * 0.5, 0) * pos["contracts"] * 100
 
+            # Mark at mid minus half spread (conservative exit assumption)
+            pos["current_value"] = max(raw - spread * 0.5, 0) * pos["contracts"] * 100
+
+            # Stop-loss
             if pos["current_value"] <= pos["premium_paid"] * (1 - STOP_LOSS_PCT):
                 cash += pos["current_value"]
-                trades_log.append({"ticker": ticker, "type": pos["type"],
-                                   "entry_date": pos["entry_date"], "exit_date": dt,
-                                   "pnl": pos["current_value"] - pos["premium_paid"],
-                                   "premium_paid": pos["premium_paid"],
-                                   "portfolio_at_entry": pos.get("portfolio_at_entry", INITIAL_CASH),
-                                   "exit_reason": "stop_loss"})
+                trades_log.append({
+                    "ticker": ticker, "type": pos["type"],
+                    "entry_date": pos["entry_date"], "exit_date": dt,
+                    "pnl": pos["current_value"] - pos["premium_paid"],
+                    "premium_paid": pos["premium_paid"],
+                    "portfolio_at_entry": pos.get("portfolio_at_entry", initial_cash),
+                    "exit_reason": "stop_loss",
+                })
                 positions.remove(pos)
                 continue
 
+            # Expiry — pay full spread on close
             if T <= 0:
-                intrinsic = max(price - pos["strike"], 0) if pos["type"] == "call" else max(pos["strike"] - price, 0)
-                payout    = max(intrinsic - BID_ASK_SPREAD, 0) * pos["contracts"] * 100
-                cash     += payout
-                trades_log.append({"ticker": ticker, "type": pos["type"],
-                                   "entry_date": pos["entry_date"], "exit_date": dt,
-                                   "pnl": payout - pos["premium_paid"],
-                                   "premium_paid": pos["premium_paid"],
-                                   "portfolio_at_entry": pos.get("portfolio_at_entry", INITIAL_CASH),
-                                   "exit_reason": "expiry"})
+                intrinsic = max(price - pos["strike"], 0) if pos["type"] == "call" \
+                            else max(pos["strike"] - price, 0)
+                payout = max(intrinsic - spread, 0) * pos["contracts"] * 100
+                cash  += payout
+                trades_log.append({
+                    "ticker": ticker, "type": pos["type"],
+                    "entry_date": pos["entry_date"], "exit_date": dt,
+                    "pnl": payout - pos["premium_paid"],
+                    "premium_paid": pos["premium_paid"],
+                    "portfolio_at_entry": pos.get("portfolio_at_entry", initial_cash),
+                    "exit_reason": "expiry",
+                })
                 positions.remove(pos)
 
-        # ── Entry signals ──
+        # ── Entry signals ──────────────────────────────────────────────────────
         options_exposure = sum(p["current_value"] for p in positions)
         portfolio_val    = cash + options_exposure
         max_total_exp    = portfolio_val * MAX_TOTAL_EXPOSURE_PCT
@@ -192,6 +325,10 @@ def run_portfolio_backtest(
             if options_exposure >= max_total_exp:
                 continue
 
+            # ── Earnings blackout: skip entries near earnings ──────────────────
+            if near_earnings(dt, ticker, earnings_dates):
+                continue
+
             df  = ticker_data[ticker]
             idx = ticker_idx[ticker].get(dt)
             if idx is None:
@@ -200,15 +337,21 @@ def run_portfolio_backtest(
             if price <= 0:
                 continue
 
-            max_premium = min(portfolio_val * MAX_TRADE_EXPOSURE_PCT, max_total_exp - options_exposure)
+            max_premium = min(portfolio_val * MAX_TRADE_EXPOSURE_PCT,
+                              max_total_exp - options_exposure)
             if cash < max_premium or max_premium <= 0:
                 continue
 
-            vol         = get_hist_vol(df, idx)
+            # Vol with IV premium (no crush on entry)
+            vol    = get_vol(df, idx, ticker, dt, earnings_dates)
+            spread = get_spread(df, idx)
+
             model_price = bs_call(price, round(price), OPTION_DTE / 365, RISK_FREE_RATE, vol) \
                           if opt_type == "call" \
                           else bs_put(price, round(price), OPTION_DTE / 365, RISK_FREE_RATE, vol)
-            entry_price = model_price + BID_ASK_SPREAD
+
+            # Pay full spread on entry
+            entry_price = model_price + spread
             if entry_price <= 0.01:
                 continue
 
@@ -227,24 +370,28 @@ def run_portfolio_backtest(
                 "portfolio_at_entry": portfolio_val,
             })
 
-    # Close remaining positions
+    # ── Close remaining positions at last price ────────────────────────────────
     for pos in positions:
         ticker  = pos["ticker"]
         df      = ticker_data[ticker]
-        price   = float(df["Close"].iloc[-1])
-        last_dt = df.index[-1]
+        last_idx = len(df) - 1
+        price   = float(df["Close"].iloc[last_idx])
+        last_dt = df.index[last_idx]
         T       = max((pos["expiry"] - last_dt).total_seconds() / (365 * 24 * 3600), 0)
-        vol     = get_hist_vol(df, len(df) - 1)
+        vol     = get_vol(df, last_idx, ticker, last_dt, earnings_dates, pos["entry_date"])
+        spread  = get_spread(df, last_idx)
         raw     = bs_call(price, pos["strike"], T, RISK_FREE_RATE, vol) if pos["type"] == "call" \
                   else bs_put(price, pos["strike"], T, RISK_FREE_RATE, vol)
-        payout  = max(raw - BID_ASK_SPREAD, 0) * pos["contracts"] * 100
+        payout  = max(raw - spread, 0) * pos["contracts"] * 100
         cash   += payout
-        trades_log.append({"ticker": ticker, "type": pos["type"],
-                           "entry_date": pos["entry_date"], "exit_date": last_dt,
-                           "pnl": payout - pos["premium_paid"],
-                           "premium_paid": pos["premium_paid"],
-                           "portfolio_at_entry": pos.get("portfolio_at_entry", INITIAL_CASH),
-                           "exit_reason": "end_of_backtest"})
+        trades_log.append({
+            "ticker": ticker, "type": pos["type"],
+            "entry_date": pos["entry_date"], "exit_date": last_dt,
+            "pnl": payout - pos["premium_paid"],
+            "premium_paid": pos["premium_paid"],
+            "portfolio_at_entry": pos.get("portfolio_at_entry", initial_cash),
+            "exit_reason": "end_of_backtest",
+        })
 
     eq_df  = pd.DataFrame(equity_curve).set_index("datetime")
     peak   = eq_df["portfolio_value"].cummax()
@@ -265,10 +412,11 @@ def run_portfolio_backtest(
 
 # ── Reporting ─────────────────────────────────────────────────────────────────
 
-def monthly_report(equity_curve: pd.DataFrame, trades_log: pd.DataFrame, initial: float = INITIAL_CASH):
-    eq  = equity_curve.copy()
+def monthly_report(equity_curve: pd.DataFrame, trades_log: pd.DataFrame,
+                   initial: float = INITIAL_CASH):
+    eq   = equity_curve.copy()
     eq.index = pd.to_datetime(eq.index)
-    mv  = eq["portfolio_value"].resample("ME").last().ffill()
+    mv   = eq["portfolio_value"].resample("ME").last().ffill()
     prev = mv.shift(1).fillna(initial)
     report = pd.DataFrame({
         "End Value ($)": mv.round(2),
@@ -281,20 +429,22 @@ def monthly_report(equity_curve: pd.DataFrame, trades_log: pd.DataFrame, initial
         tlog = trades_log.copy()
         tlog["exit_date"] = pd.to_datetime(tlog["exit_date"]).dt.tz_localize(None)
         tlog["month"]     = tlog["exit_date"].values.astype("datetime64[M]")
-        mt = tlog.groupby("month").agg(trades=("pnl","count"), wins=("pnl", lambda x: (x>0).sum()))
+        mt = tlog.groupby("month").agg(
+            trades=("pnl", "count"),
+            wins=("pnl", lambda x: (x > 0).sum())
+        )
         mt["win_rate"] = (mt["wins"] / mt["trades"] * 100).round(1)
         mt.index = mt.index.strftime("%Y-%m")
-        report   = report.join(mt[["trades","win_rate"]], how="left")
-        report.rename(columns={"trades":"# Trades","win_rate":"Win%"}, inplace=True)
+        report = report.join(mt[["trades", "win_rate"]], how="left")
+        report.rename(columns={"trades": "# Trades", "win_rate": "Win%"}, inplace=True)
         report["# Trades"] = report["# Trades"].fillna(0).astype(int)
         report["Win%"]     = report["Win%"].fillna(0)
 
     return report
 
 
-def print_results(results: dict, label: str = "FULL BACKTEST"):
+def print_results(results: dict, label: str = "BACKTEST RESULTS"):
     r = results
-    ic = r["final_value"] - r["total_return"] / 100 * r["final_value"] / (1 + r["total_return"] / 100)
     print(f"\n{'='*55}")
     print(f"  {label}")
     print(f"{'='*55}")
@@ -304,21 +454,21 @@ def print_results(results: dict, label: str = "FULL BACKTEST"):
     print(f"  Total Trades   : {r['total_trades']:>12}")
     print(f"  Win Rate       : {r['win_rate']:>11.2f}%")
     print(f"{'='*55}")
-    mr = monthly_report(r["equity_curve"], r["trades_log"])
-    print(mr.to_string())
+    print(monthly_report(r["equity_curve"], r["trades_log"]).to_string())
 
 
 def main():
     import os
     os.makedirs("results", exist_ok=True)
-    ticker_data = fetch_all(SP500_TICKERS)
-    indicators  = {t: compute_indicators(df) for t, df in ticker_data.items()}
-    results     = run_portfolio_backtest(ticker_data, indicators)
+    ticker_data    = fetch_all(SP500_TICKERS)
+    earnings_dates = fetch_earnings_dates(list(ticker_data.keys()))
+    indicators     = {t: compute_indicators(df) for t, df in ticker_data.items()}
+    results        = run_portfolio_backtest(ticker_data, indicators, earnings_dates)
     print_results(results)
     results["equity_curve"].to_csv("results/equity_curve.csv")
     results["trades_log"].to_csv("results/trades_log.csv", index=False)
     monthly_report(results["equity_curve"], results["trades_log"]).to_csv("results/monthly_report.csv")
-    print("\nSaved results/")
+    print("\nSaved to results/")
 
 
 if __name__ == "__main__":
