@@ -45,12 +45,22 @@ MAX_TOTAL_EXPOSURE_PCT  = 0.20
 RISK_FREE_RATE          = 0.05
 OPTION_DTE              = 30
 STOP_LOSS_PCT           = 0.50
+TAKE_PROFIT_PCT         = 0.20
 COMMISSION_PER_CONTRACT = 0.65
 EMA_FAST                = 12
 EMA_SLOW                = 26
 RSI_PERIOD              = 14
 RSI_OB                  = 70
 RSI_OS                  = 30
+
+# Additional signal parameters
+RSI_EXTREME_OB          = 80    # RSI above this → buy put
+RSI_EXTREME_OS          = 20    # RSI below this → buy call
+BB_PERIOD               = 20
+BB_STD                  = 2.0
+MACD_FAST               = 12
+MACD_SLOW               = 26
+MACD_SIGNAL             = 9
 
 # ── Realism parameters ────────────────────────────────────────────────────────
 IV_PREMIUM_MULT     = 1.25   # implied vol is ~25% above realized
@@ -124,24 +134,54 @@ def fetch_earnings_dates(tickers: list) -> dict:
 
 def compute_indicators(df: pd.DataFrame) -> pd.DataFrame:
     df = df.copy()
-    df["ema_fast"] = df["Close"].ewm(span=EMA_FAST, adjust=False).mean()
-    df["ema_slow"] = df["Close"].ewm(span=EMA_SLOW, adjust=False).mean()
+    close = df["Close"]
 
-    delta = df["Close"].diff()
+    df["ema_fast"] = close.ewm(span=EMA_FAST, adjust=False).mean()
+    df["ema_slow"] = close.ewm(span=EMA_SLOW, adjust=False).mean()
+
+    delta = close.diff()
     gain  = delta.clip(lower=0).rolling(RSI_PERIOD).mean()
     loss  = (-delta.clip(upper=0)).rolling(RSI_PERIOD).mean()
     df["rsi"] = 100 - (100 / (1 + gain / loss.replace(0, np.nan)))
 
-    bull = (df["ema_fast"] > df["ema_slow"]) & \
-           (df["ema_fast"].shift(1) <= df["ema_slow"].shift(1)) & \
-           (df["rsi"] < RSI_OB)
-    bear = (df["ema_fast"] < df["ema_slow"]) & \
-           (df["ema_fast"].shift(1) >= df["ema_slow"].shift(1)) & \
-           (df["rsi"] > RSI_OS)
+    # Bollinger Bands
+    df["bb_mid"]   = close.rolling(BB_PERIOD).mean()
+    df["bb_std"]   = close.rolling(BB_PERIOD).std()
+    df["bb_upper"] = df["bb_mid"] + BB_STD * df["bb_std"]
+    df["bb_lower"] = df["bb_mid"] - BB_STD * df["bb_std"]
 
+    # MACD histogram
+    macd_fast_line = close.ewm(span=MACD_FAST, adjust=False).mean()
+    macd_slow_line = close.ewm(span=MACD_SLOW, adjust=False).mean()
+    df["macd_line"]   = macd_fast_line - macd_slow_line
+    df["macd_signal"] = df["macd_line"].ewm(span=MACD_SIGNAL, adjust=False).mean()
+    df["macd_hist"]   = df["macd_line"] - df["macd_signal"]
+
+    # ── EMA crossover signals (original) ──
+    ema_bull = (df["ema_fast"] > df["ema_slow"]) & \
+               (df["ema_fast"].shift(1) <= df["ema_slow"].shift(1)) & \
+               (df["rsi"] < RSI_OB)
+    ema_bear = (df["ema_fast"] < df["ema_slow"]) & \
+               (df["ema_fast"].shift(1) >= df["ema_slow"].shift(1)) & \
+               (df["rsi"] > RSI_OS)
+
+    # ── RSI extreme signals ──
+    rsi_bull = df["rsi"] < RSI_EXTREME_OS
+    rsi_bear = df["rsi"] > RSI_EXTREME_OB
+
+    # ── Bollinger Band signals ──
+    bb_bull = close <= df["bb_lower"]
+    bb_bear = close >= df["bb_upper"]
+
+    # ── MACD histogram flip signals ──
+    macd_bull = (df["macd_hist"] > 0) & (df["macd_hist"].shift(1) <= 0)
+    macd_bear = (df["macd_hist"] < 0) & (df["macd_hist"].shift(1) >= 0)
+
+    # Combine: any bullish signal → +1, any bearish → -1
+    # If both fire on same bar, bullish takes priority (arbitrary)
     df["signal"] = 0
-    df.loc[bull, "signal"] =  1
-    df.loc[bear, "signal"] = -1
+    df.loc[ema_bull | rsi_bull | bb_bull | macd_bull, "signal"] =  1
+    df.loc[(ema_bear | rsi_bear | bb_bear | macd_bear) & (df["signal"] == 0), "signal"] = -1
 
     # Flag gap-open bars (>3% overnight gap) for spread widening
     df["gap"] = (df["Open"] - df["Close"].shift(1)).abs() / df["Close"].shift(1)
@@ -288,6 +328,20 @@ def run_portfolio_backtest(
                     "premium_paid": pos["premium_paid"],
                     "portfolio_at_entry": pos.get("portfolio_at_entry", initial_cash),
                     "exit_reason": "stop_loss",
+                })
+                positions.remove(pos)
+                continue
+
+            # Take-profit
+            if pos["current_value"] >= pos["premium_paid"] * (1 + TAKE_PROFIT_PCT):
+                cash += pos["current_value"]
+                trades_log.append({
+                    "ticker": ticker, "type": pos["type"],
+                    "entry_date": pos["entry_date"], "exit_date": dt,
+                    "pnl": pos["current_value"] - pos["premium_paid"],
+                    "premium_paid": pos["premium_paid"],
+                    "portfolio_at_entry": pos.get("portfolio_at_entry", initial_cash),
+                    "exit_reason": "take_profit",
                 })
                 positions.remove(pos)
                 continue

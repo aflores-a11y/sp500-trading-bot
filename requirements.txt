@@ -4,3 +4,6 @@ pandas
 pandas-ta
 numpy
 matplotlib
+scipy
+ib_insync
+pytz
