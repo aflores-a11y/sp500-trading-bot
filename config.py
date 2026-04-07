@@ -68,8 +68,8 @@ OPT_CLOSE_DTE       = 5     # close position when DTE falls below this
 
 # ─── Additional options signal parameters ─────────────────────────────────────
 # RSI extreme entries (no crossover needed)
-OPT_RSI_EXTREME_OB  = 80    # RSI above this → buy put (strong overbought)
-OPT_RSI_EXTREME_OS  = 20    # RSI below this → buy call (strong oversold)
+OPT_RSI_EXTREME_OB  = 80    # RSI above this -> buy put (strong overbought)
+OPT_RSI_EXTREME_OS  = 20    # RSI below this -> buy call (strong oversold)
 
 # Bollinger Band signals
 OPT_BB_PERIOD       = 20
@@ -79,6 +79,20 @@ OPT_BB_STD          = 2.0
 OPT_MACD_FAST       = 12
 OPT_MACD_SLOW       = 26
 OPT_MACD_SIGNAL     = 9
+
+# ─── Strategy engine parameters ───────────────────────────────────────────────
+# IV rank thresholds (0-100 percentile over ~1 year HV)
+IV_RANK_LOW          = 30     # below this = IV is cheap -> favor buying
+IV_RANK_HIGH         = 60     # above this = IV is rich -> favor selling
+
+# Spread construction
+SPREAD_WIDTH         = 5.0    # $ width of vertical spreads
+CONDOR_WING_WIDTH    = 5.0    # $ width of each condor wing
+DTE_SHORT            = 21     # DTE for near-term legs / single-leg trades
+DTE_LONG             = 45     # DTE for far-term leg (calendar spreads)
+
+# Strategy selection
+MIN_STRATEGY_SCORE   = 35.0   # minimum score to open any trade
 
 # ─── Options position sizing ───────────────────────────────────────────────────
 OPT_MAX_TRADE_PCT   = 0.02   # max 2 % of account per options trade

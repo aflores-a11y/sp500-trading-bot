@@ -13,7 +13,9 @@ Wraps ib_insync to provide a simple interface for the live trader:
 import logging
 from datetime import datetime, timedelta
 
-from ib_insync import IB, LimitOrder, MarketOrder, Option, Stock, StopOrder
+from ib_insync import IB, LimitOrder, MarketOrder, Option, Stock, StopOrder, TagValue
+from ib_insync import Contract as IBContract
+from ib_insync.order import Order as IBOrder
 
 logger = logging.getLogger(__name__)
 
@@ -274,6 +276,170 @@ class IBBroker:
         logger.info(
             f"[OPT ORDER] {action} {qty}x {contract.symbol} {contract.right} "
             f"${contract.strike} exp={contract.lastTradeDateOrContractMonth} @ {price_str}"
+        )
+        return trade
+
+    # ── multi-leg combo orders ─────────────────────────────────────────────
+
+    def _build_combo_contract(self, symbol: str, legs: list) -> IBContract:
+        """
+        Build an IB combo (BAG) contract from a list of qualified Option contracts.
+        Each entry in legs: (contract, action, ratio)
+        """
+        combo = IBContract()
+        combo.symbol = symbol
+        combo.secType = "BAG"
+        combo.currency = "USD"
+        combo.exchange = "SMART"
+
+        from ib_insync import ComboLeg
+        combo.comboLegs = []
+        for contract, action, ratio in legs:
+            leg = ComboLeg()
+            leg.conId = contract.conId
+            leg.ratio = ratio
+            leg.action = action
+            leg.exchange = contract.exchange or "SMART"
+            combo.comboLegs.append(leg)
+
+        return combo
+
+    def place_spread_order(
+        self,
+        symbol: str,
+        sell_contract,
+        buy_contract,
+        qty: int,
+        net_price: float = None,
+    ):
+        """
+        Place a 2-leg spread order (credit or debit).
+        net_price > 0 = you pay (debit), net_price < 0 = you collect (credit).
+        For credit spreads, pass negative net_price.
+        """
+        legs = [
+            (sell_contract, "SELL", 1),
+            (buy_contract,  "BUY",  1),
+        ]
+        combo = self._build_combo_contract(symbol, legs)
+
+        if net_price is not None:
+            snapped = round(round(net_price / 0.05) * 0.05, 2)
+            order = LimitOrder("BUY", qty, snapped)
+            price_str = f"LMT ${snapped:.2f}"
+        else:
+            order = MarketOrder("BUY", qty)
+            price_str = "MKT"
+
+        trade = self.ib.placeOrder(combo, order)
+        logger.info(
+            f"[SPREAD] {symbol} | SELL {sell_contract.right} ${sell_contract.strike} + "
+            f"BUY {buy_contract.right} ${buy_contract.strike} | "
+            f"{qty}x @ {price_str}"
+        )
+        return trade
+
+    def place_iron_condor(
+        self,
+        symbol: str,
+        put_sell_contract,
+        put_buy_contract,
+        call_sell_contract,
+        call_buy_contract,
+        qty: int,
+        net_price: float = None,
+    ):
+        """
+        Place a 4-leg iron condor order.
+        net_price should be negative (credit collected).
+        """
+        legs = [
+            (put_sell_contract,  "SELL", 1),
+            (put_buy_contract,   "BUY",  1),
+            (call_sell_contract, "SELL", 1),
+            (call_buy_contract,  "BUY",  1),
+        ]
+        combo = self._build_combo_contract(symbol, legs)
+
+        if net_price is not None:
+            snapped = round(round(net_price / 0.05) * 0.05, 2)
+            order = LimitOrder("BUY", qty, snapped)
+            price_str = f"LMT ${snapped:.2f}"
+        else:
+            order = MarketOrder("BUY", qty)
+            price_str = "MKT"
+
+        trade = self.ib.placeOrder(combo, order)
+        logger.info(
+            f"[CONDOR] {symbol} | "
+            f"SELL P${put_sell_contract.strike}/BUY P${put_buy_contract.strike} + "
+            f"SELL C${call_sell_contract.strike}/BUY C${call_buy_contract.strike} | "
+            f"{qty}x @ {price_str}"
+        )
+        return trade
+
+    def place_calendar_spread(
+        self,
+        symbol: str,
+        sell_near_contract,
+        buy_far_contract,
+        qty: int,
+        net_price: float = None,
+    ):
+        """
+        Place a calendar spread: sell near-term, buy far-term (same strike).
+        net_price > 0 = debit (normal for calendars).
+        """
+        legs = [
+            (sell_near_contract, "SELL", 1),
+            (buy_far_contract,   "BUY",  1),
+        ]
+        combo = self._build_combo_contract(symbol, legs)
+
+        if net_price is not None:
+            snapped = round(round(net_price / 0.05) * 0.05, 2)
+            order = LimitOrder("BUY", qty, snapped)
+            price_str = f"LMT ${snapped:.2f}"
+        else:
+            order = MarketOrder("BUY", qty)
+            price_str = "MKT"
+
+        trade = self.ib.placeOrder(combo, order)
+        logger.info(
+            f"[CALENDAR] {symbol} | SELL {sell_near_contract.right} "
+            f"${sell_near_contract.strike} exp={sell_near_contract.lastTradeDateOrContractMonth} + "
+            f"BUY ${buy_far_contract.strike} exp={buy_far_contract.lastTradeDateOrContractMonth} | "
+            f"{qty}x @ {price_str}"
+        )
+        return trade
+
+    def place_straddle(
+        self,
+        call_contract,
+        put_contract,
+        qty: int,
+        net_price: float = None,
+    ):
+        """Place a straddle: buy call + buy put at same strike."""
+        symbol = call_contract.symbol
+        legs = [
+            (call_contract, "BUY", 1),
+            (put_contract,  "BUY", 1),
+        ]
+        combo = self._build_combo_contract(symbol, legs)
+
+        if net_price is not None:
+            snapped = round(round(net_price / 0.05) * 0.05, 2)
+            order = LimitOrder("BUY", qty, snapped)
+            price_str = f"LMT ${snapped:.2f}"
+        else:
+            order = MarketOrder("BUY", qty)
+            price_str = "MKT"
+
+        trade = self.ib.placeOrder(combo, order)
+        logger.info(
+            f"[STRADDLE] {symbol} | BUY C${call_contract.strike} + "
+            f"BUY P${put_contract.strike} | {qty}x @ {price_str}"
         )
         return trade
 

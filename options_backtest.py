@@ -54,8 +54,8 @@ RSI_OB                  = 70
 RSI_OS                  = 30
 
 # Additional signal parameters
-RSI_EXTREME_OB          = 80    # RSI above this → buy put
-RSI_EXTREME_OS          = 20    # RSI below this → buy call
+RSI_EXTREME_OB          = 80    # RSI above this -> buy put
+RSI_EXTREME_OS          = 20    # RSI below this -> buy call
 BB_PERIOD               = 20
 BB_STD                  = 2.0
 MACD_FAST               = 12
@@ -177,7 +177,7 @@ def compute_indicators(df: pd.DataFrame) -> pd.DataFrame:
     macd_bull = (df["macd_hist"] > 0) & (df["macd_hist"].shift(1) <= 0)
     macd_bear = (df["macd_hist"] < 0) & (df["macd_hist"].shift(1) >= 0)
 
-    # Combine: any bullish signal → +1, any bearish → -1
+    # Combine: any bullish signal -> +1, any bearish -> -1
     # If both fire on same bar, bullish takes priority (arbitrary)
     df["signal"] = 0
     df.loc[ema_bull | rsi_bull | bb_bull | macd_bull, "signal"] =  1
@@ -308,62 +308,151 @@ def run_portfolio_backtest(
             price = float(df["Close"].iloc[idx])
             T     = max((pos["expiry"] - dt).total_seconds() / (365 * 24 * 3600), 0)
 
-            # Vol with IV crush applied if earnings fell after entry
             vol    = get_vol(df, idx, ticker, dt, earnings_dates, pos["entry_date"])
             spread = get_spread(df, idx)
+            strategy = pos.get("strategy", "buy_call")
+            is_credit = strategy in ("bull_put_spread", "bear_call_spread", "iron_condor")
 
-            raw = bs_call(price, pos["strike"], T, RISK_FREE_RATE, vol) if pos["type"] == "call" \
-                  else bs_put(price, pos["strike"], T, RISK_FREE_RATE, vol)
+            # ── Mark-to-market based on strategy type ──
+            if strategy in ("buy_call", "buy_put"):
+                raw = bs_call(price, pos["strike"], T, RISK_FREE_RATE, vol) if pos["type"] == "call" \
+                      else bs_put(price, pos["strike"], T, RISK_FREE_RATE, vol)
+                pos["current_value"] = max(raw - spread * 0.5, 0) * pos["contracts"] * 100
 
-            # Mark at mid minus half spread (conservative exit assumption)
-            pos["current_value"] = max(raw - spread * 0.5, 0) * pos["contracts"] * 100
+            elif strategy == "bull_put_spread":
+                sell_val = bs_put(price, pos["strike"], T, RISK_FREE_RATE, vol)
+                buy_val  = bs_put(price, pos["strike_buy"], T, RISK_FREE_RATE, vol)
+                net_val  = max(sell_val - buy_val, 0)  # cost to close
+                pos["current_value"] = (net_val + spread) * pos["contracts"] * 100
 
-            # Stop-loss
-            if pos["current_value"] <= pos["premium_paid"] * (1 - STOP_LOSS_PCT):
-                cash += pos["current_value"]
-                trades_log.append({
-                    "ticker": ticker, "type": pos["type"],
-                    "entry_date": pos["entry_date"], "exit_date": dt,
-                    "pnl": pos["current_value"] - pos["premium_paid"],
-                    "premium_paid": pos["premium_paid"],
-                    "portfolio_at_entry": pos.get("portfolio_at_entry", initial_cash),
-                    "exit_reason": "stop_loss",
-                })
-                positions.remove(pos)
-                continue
+            elif strategy == "bear_call_spread":
+                sell_val = bs_call(price, pos["strike"], T, RISK_FREE_RATE, vol)
+                buy_val  = bs_call(price, pos["strike_buy"], T, RISK_FREE_RATE, vol)
+                net_val  = max(sell_val - buy_val, 0)
+                pos["current_value"] = (net_val + spread) * pos["contracts"] * 100
 
-            # Take-profit
-            if pos["current_value"] >= pos["premium_paid"] * (1 + TAKE_PROFIT_PCT):
-                cash += pos["current_value"]
-                trades_log.append({
-                    "ticker": ticker, "type": pos["type"],
-                    "entry_date": pos["entry_date"], "exit_date": dt,
-                    "pnl": pos["current_value"] - pos["premium_paid"],
-                    "premium_paid": pos["premium_paid"],
-                    "portfolio_at_entry": pos.get("portfolio_at_entry", initial_cash),
-                    "exit_reason": "take_profit",
-                })
-                positions.remove(pos)
-                continue
+            elif strategy == "iron_condor":
+                p_sell = bs_put(price, pos["strike"], T, RISK_FREE_RATE, vol)
+                p_buy  = bs_put(price, pos["strike_buy"], T, RISK_FREE_RATE, vol)
+                c_sell = bs_call(price, pos["strike_sell_2"], T, RISK_FREE_RATE, vol)
+                c_buy  = bs_call(price, pos["strike_buy_2"], T, RISK_FREE_RATE, vol)
+                net_val = max(p_sell - p_buy, 0) + max(c_sell - c_buy, 0)
+                pos["current_value"] = (net_val + spread * 2) * pos["contracts"] * 100
 
-            # Expiry — pay full spread on close
+            elif strategy == "buy_straddle":
+                call_val = bs_call(price, pos["strike"], T, RISK_FREE_RATE, vol)
+                put_val  = bs_put(price, pos["strike"], T, RISK_FREE_RATE, vol)
+                pos["current_value"] = max(call_val + put_val - spread, 0) * pos["contracts"] * 100
+
+            elif strategy == "calendar_spread":
+                # Approximate: value increases as near-term decays faster
+                T_far = T + (pos.get("dte_far", 45) - pos.get("dte_near", 21)) / 365.0
+                near_val = bs_call(price, pos["strike"], T, RISK_FREE_RATE, vol)
+                far_val  = bs_call(price, pos["strike"], T_far, RISK_FREE_RATE, vol)
+                pos["current_value"] = max(far_val - near_val - spread * 0.5, 0) * pos["contracts"] * 100
+
+            # ── Exit checks ──
+            if is_credit:
+                credit = pos.get("credit_collected", pos["premium_paid"])
+                close_cost = pos["current_value"]
+                pnl_pct = (credit - close_cost) / credit * 100 if credit > 0 else 0
+
+                if pnl_pct >= 50.0:  # captured 50% of credit
+                    cash += credit - close_cost
+                    trades_log.append({
+                        "ticker": ticker, "type": strategy,
+                        "entry_date": pos["entry_date"], "exit_date": dt,
+                        "pnl": credit - close_cost,
+                        "premium_paid": pos["premium_paid"],
+                        "portfolio_at_entry": pos.get("portfolio_at_entry", initial_cash),
+                        "exit_reason": "take_profit",
+                    })
+                    positions.remove(pos)
+                    continue
+                elif pnl_pct <= -100.0:
+                    cash += credit - close_cost
+                    trades_log.append({
+                        "ticker": ticker, "type": strategy,
+                        "entry_date": pos["entry_date"], "exit_date": dt,
+                        "pnl": credit - close_cost,
+                        "premium_paid": pos["premium_paid"],
+                        "portfolio_at_entry": pos.get("portfolio_at_entry", initial_cash),
+                        "exit_reason": "stop_loss",
+                    })
+                    positions.remove(pos)
+                    continue
+            else:
+                # Debit strategy exits
+                if pos["current_value"] <= pos["premium_paid"] * (1 - STOP_LOSS_PCT):
+                    cash += pos["current_value"]
+                    trades_log.append({
+                        "ticker": ticker, "type": strategy,
+                        "entry_date": pos["entry_date"], "exit_date": dt,
+                        "pnl": pos["current_value"] - pos["premium_paid"],
+                        "premium_paid": pos["premium_paid"],
+                        "portfolio_at_entry": pos.get("portfolio_at_entry", initial_cash),
+                        "exit_reason": "stop_loss",
+                    })
+                    positions.remove(pos)
+                    continue
+
+                if pos["current_value"] >= pos["premium_paid"] * (1 + TAKE_PROFIT_PCT):
+                    cash += pos["current_value"]
+                    trades_log.append({
+                        "ticker": ticker, "type": strategy,
+                        "entry_date": pos["entry_date"], "exit_date": dt,
+                        "pnl": pos["current_value"] - pos["premium_paid"],
+                        "premium_paid": pos["premium_paid"],
+                        "portfolio_at_entry": pos.get("portfolio_at_entry", initial_cash),
+                        "exit_reason": "take_profit",
+                    })
+                    positions.remove(pos)
+                    continue
+
+            # Expiry
             if T <= 0:
-                intrinsic = max(price - pos["strike"], 0) if pos["type"] == "call" \
-                            else max(pos["strike"] - price, 0)
-                payout = max(intrinsic - spread, 0) * pos["contracts"] * 100
-                cash  += payout
-                trades_log.append({
-                    "ticker": ticker, "type": pos["type"],
-                    "entry_date": pos["entry_date"], "exit_date": dt,
-                    "pnl": payout - pos["premium_paid"],
-                    "premium_paid": pos["premium_paid"],
-                    "portfolio_at_entry": pos.get("portfolio_at_entry", initial_cash),
-                    "exit_reason": "expiry",
-                })
+                if is_credit:
+                    credit = pos.get("credit_collected", pos["premium_paid"])
+                    payout = credit  # full credit if both legs expire worthless
+                    if strategy == "bull_put_spread":
+                        intrinsic = max(pos["strike"] - price, 0) - max(pos["strike_buy"] - price, 0)
+                        payout = credit - max(intrinsic, 0) * pos["contracts"] * 100
+                    elif strategy == "bear_call_spread":
+                        intrinsic = max(price - pos["strike"], 0) - max(price - pos["strike_buy"], 0)
+                        payout = credit - max(intrinsic, 0) * pos["contracts"] * 100
+                    elif strategy == "iron_condor":
+                        put_intr = max(pos["strike"] - price, 0) - max(pos["strike_buy"] - price, 0)
+                        call_intr = max(price - pos["strike_sell_2"], 0) - max(price - pos["strike_buy_2"], 0)
+                        payout = credit - max(put_intr + call_intr, 0) * pos["contracts"] * 100
+                    cash += payout
+                    trades_log.append({
+                        "ticker": ticker, "type": strategy,
+                        "entry_date": pos["entry_date"], "exit_date": dt,
+                        "pnl": payout - pos["premium_paid"],
+                        "premium_paid": pos["premium_paid"],
+                        "portfolio_at_entry": pos.get("portfolio_at_entry", initial_cash),
+                        "exit_reason": "expiry",
+                    })
+                else:
+                    if strategy == "buy_straddle":
+                        intrinsic = max(price - pos["strike"], 0) + max(pos["strike"] - price, 0)
+                    else:
+                        intrinsic = max(price - pos["strike"], 0) if pos["type"] == "call" \
+                                    else max(pos["strike"] - price, 0)
+                    payout = max(intrinsic - spread, 0) * pos["contracts"] * 100
+                    cash += payout
+                    trades_log.append({
+                        "ticker": ticker, "type": strategy,
+                        "entry_date": pos["entry_date"], "exit_date": dt,
+                        "pnl": payout - pos["premium_paid"],
+                        "premium_paid": pos["premium_paid"],
+                        "portfolio_at_entry": pos.get("portfolio_at_entry", initial_cash),
+                        "exit_reason": "expiry",
+                    })
                 positions.remove(pos)
 
-        # ── Entry signals ──────────────────────────────────────────────────────
-        options_exposure = sum(p["current_value"] for p in positions)
+        # ── Entry signals with adaptive strategy selection ─────────────────────
+        options_exposure = sum(abs(p["current_value"]) for p in positions)
         portfolio_val    = cash + options_exposure
         max_total_exp    = portfolio_val * MAX_TOTAL_EXPOSURE_PCT
 
@@ -371,15 +460,10 @@ def run_portfolio_backtest(
             if dt not in ind_df.index:
                 continue
             signal = ind_df.loc[dt, "signal"]
-            if signal == 0:
-                continue
-            opt_type = "call" if signal == 1 else "put"
-            if any(p["ticker"] == ticker and p["type"] == opt_type for p in positions):
+            if any(p["ticker"] == ticker for p in positions):
                 continue
             if options_exposure >= max_total_exp:
                 continue
-
-            # ── Earnings blackout: skip entries near earnings ──────────────────
             if near_earnings(dt, ticker, earnings_dates):
                 continue
 
@@ -396,37 +480,199 @@ def run_portfolio_backtest(
             if cash < max_premium or max_premium <= 0:
                 continue
 
-            # Vol with IV premium (no crush on entry)
             vol    = get_vol(df, idx, ticker, dt, earnings_dates)
             spread = get_spread(df, idx)
 
-            model_price = bs_call(price, round(price), OPTION_DTE / 365, RISK_FREE_RATE, vol) \
-                          if opt_type == "call" \
-                          else bs_put(price, round(price), OPTION_DTE / 365, RISK_FREE_RATE, vol)
+            # Compute IV rank from rolling HV
+            hv_series = df["Close"].iloc[max(0, idx - 252): idx + 1]
+            if len(hv_series) > 30:
+                log_ret = np.log(hv_series / hv_series.shift(1)).dropna()
+                rolling_hv = log_ret.rolling(20).std() * np.sqrt(252)
+                rolling_hv = rolling_hv.dropna()
+                if len(rolling_hv) > 5:
+                    iv_min, iv_max = rolling_hv.min(), rolling_hv.max()
+                    iv_rank = (vol - iv_min) / (iv_max - iv_min) * 100 if iv_max > iv_min else 50
+                else:
+                    iv_rank = 50
+            else:
+                iv_rank = 50
 
-            # Pay full spread on entry
-            entry_price = model_price + spread
-            if entry_price <= 0.01:
-                continue
+            hv_raw = historical_vol(df["Close"].iloc[max(0, idx-30):idx+1].values, window=20)
+            iv_hv_ratio = vol / hv_raw if hv_raw > 0 else 1.0
 
-            contracts  = max(1, int(max_premium / (entry_price * 100)))
-            premium    = entry_price * contracts * 100
-            commission = contracts * COMMISSION_PER_CONTRACT
-            if cash < premium + commission:
-                continue
+            # Determine direction from signal
+            if signal == 1:
+                direction = "bullish"
+            elif signal == -1:
+                direction = "bearish"
+            else:
+                direction = "neutral"
 
-            cash             -= premium + commission
-            options_exposure += premium
-            positions.append({
-                "ticker": ticker, "type": opt_type, "strike": round(price),
-                "contracts": contracts, "premium_paid": premium, "current_value": premium,
-                "entry_date": dt, "expiry": dt + timedelta(days=OPTION_DTE),
-                "portfolio_at_entry": portfolio_val,
-            })
+            # Strategy selection based on direction + IV regime
+            SPREAD_WIDTH = 5.0
+            T_short = OPTION_DTE / 365.0
+
+            if direction == "bullish" and iv_rank < 40:
+                strategy = "buy_call"
+            elif direction == "bullish" and iv_rank >= 40:
+                strategy = "bull_put_spread"
+            elif direction == "bearish" and iv_rank < 40:
+                strategy = "buy_put"
+            elif direction == "bearish" and iv_rank >= 40:
+                strategy = "bear_call_spread"
+            elif direction == "neutral" and iv_rank >= 60:
+                strategy = "iron_condor"
+            elif direction == "neutral" and iv_rank < 30:
+                strategy = "buy_straddle"
+            else:
+                continue  # no clear setup
+
+            strike = round(price)
+
+            if strategy == "buy_call":
+                entry_price = bs_call(price, strike, T_short, RISK_FREE_RATE, vol) + spread
+                if entry_price <= 0.01:
+                    continue
+                contracts = max(1, int(max_premium / (entry_price * 100)))
+                premium = entry_price * contracts * 100
+                commission = contracts * COMMISSION_PER_CONTRACT
+                if cash < premium + commission:
+                    continue
+                cash -= premium + commission
+                options_exposure += premium
+                positions.append({
+                    "ticker": ticker, "type": "call", "strategy": strategy,
+                    "strike": strike, "contracts": contracts,
+                    "premium_paid": premium, "current_value": premium,
+                    "entry_date": dt, "expiry": dt + timedelta(days=OPTION_DTE),
+                    "portfolio_at_entry": portfolio_val,
+                })
+
+            elif strategy == "buy_put":
+                entry_price = bs_put(price, strike, T_short, RISK_FREE_RATE, vol) + spread
+                if entry_price <= 0.01:
+                    continue
+                contracts = max(1, int(max_premium / (entry_price * 100)))
+                premium = entry_price * contracts * 100
+                commission = contracts * COMMISSION_PER_CONTRACT
+                if cash < premium + commission:
+                    continue
+                cash -= premium + commission
+                options_exposure += premium
+                positions.append({
+                    "ticker": ticker, "type": "put", "strategy": strategy,
+                    "strike": strike, "contracts": contracts,
+                    "premium_paid": premium, "current_value": premium,
+                    "entry_date": dt, "expiry": dt + timedelta(days=OPTION_DTE),
+                    "portfolio_at_entry": portfolio_val,
+                })
+
+            elif strategy == "bull_put_spread":
+                sell_strike = round(price - price * 0.02)
+                buy_strike = sell_strike - SPREAD_WIDTH
+                credit = bs_put(price, sell_strike, T_short, RISK_FREE_RATE, vol) - \
+                         bs_put(price, buy_strike, T_short, RISK_FREE_RATE, vol)
+                credit = max(credit - spread, 0.01)
+                max_loss = SPREAD_WIDTH - credit
+                contracts = max(1, int(max_premium / (max_loss * 100)))
+                commission = contracts * COMMISSION_PER_CONTRACT * 2
+                collateral = max_loss * contracts * 100
+                if cash < collateral + commission:
+                    continue
+                cash -= commission  # credit received later at close
+                options_exposure += collateral
+                positions.append({
+                    "ticker": ticker, "type": "put", "strategy": strategy,
+                    "strike": sell_strike, "strike_buy": buy_strike,
+                    "contracts": contracts,
+                    "premium_paid": collateral,
+                    "credit_collected": credit * contracts * 100,
+                    "current_value": credit * contracts * 100,
+                    "entry_date": dt, "expiry": dt + timedelta(days=OPTION_DTE),
+                    "portfolio_at_entry": portfolio_val,
+                })
+
+            elif strategy == "bear_call_spread":
+                sell_strike = round(price + price * 0.02)
+                buy_strike = sell_strike + SPREAD_WIDTH
+                credit = bs_call(price, sell_strike, T_short, RISK_FREE_RATE, vol) - \
+                         bs_call(price, buy_strike, T_short, RISK_FREE_RATE, vol)
+                credit = max(credit - spread, 0.01)
+                max_loss = SPREAD_WIDTH - credit
+                contracts = max(1, int(max_premium / (max_loss * 100)))
+                commission = contracts * COMMISSION_PER_CONTRACT * 2
+                collateral = max_loss * contracts * 100
+                if cash < collateral + commission:
+                    continue
+                cash -= commission
+                options_exposure += collateral
+                positions.append({
+                    "ticker": ticker, "type": "call", "strategy": strategy,
+                    "strike": sell_strike, "strike_buy": buy_strike,
+                    "contracts": contracts,
+                    "premium_paid": collateral,
+                    "credit_collected": credit * contracts * 100,
+                    "current_value": credit * contracts * 100,
+                    "entry_date": dt, "expiry": dt + timedelta(days=OPTION_DTE),
+                    "portfolio_at_entry": portfolio_val,
+                })
+
+            elif strategy == "iron_condor":
+                put_sell = round(price - price * 0.03)
+                put_buy = put_sell - SPREAD_WIDTH
+                call_sell = round(price + price * 0.03)
+                call_buy = call_sell + SPREAD_WIDTH
+                p_credit = bs_put(price, put_sell, T_short, RISK_FREE_RATE, vol) - \
+                           bs_put(price, put_buy, T_short, RISK_FREE_RATE, vol)
+                c_credit = bs_call(price, call_sell, T_short, RISK_FREE_RATE, vol) - \
+                           bs_call(price, call_buy, T_short, RISK_FREE_RATE, vol)
+                total_credit = max(p_credit + c_credit - spread * 2, 0.01)
+                max_loss = SPREAD_WIDTH - total_credit
+                contracts = max(1, int(max_premium / (max_loss * 100)))
+                commission = contracts * COMMISSION_PER_CONTRACT * 4
+                collateral = max_loss * contracts * 100
+                if cash < collateral + commission:
+                    continue
+                cash -= commission
+                options_exposure += collateral
+                positions.append({
+                    "ticker": ticker, "type": "condor", "strategy": strategy,
+                    "strike": put_sell, "strike_buy": put_buy,
+                    "strike_sell_2": call_sell, "strike_buy_2": call_buy,
+                    "contracts": contracts,
+                    "premium_paid": collateral,
+                    "credit_collected": total_credit * contracts * 100,
+                    "current_value": total_credit * contracts * 100,
+                    "entry_date": dt, "expiry": dt + timedelta(days=OPTION_DTE),
+                    "portfolio_at_entry": portfolio_val,
+                })
+
+            elif strategy == "buy_straddle":
+                call_prem = bs_call(price, strike, T_short, RISK_FREE_RATE, vol)
+                put_prem = bs_put(price, strike, T_short, RISK_FREE_RATE, vol)
+                entry_price = call_prem + put_prem + spread * 2
+                if entry_price <= 0.01:
+                    continue
+                contracts = max(1, int(max_premium / (entry_price * 100)))
+                premium = entry_price * contracts * 100
+                commission = contracts * COMMISSION_PER_CONTRACT * 2
+                if cash < premium + commission:
+                    continue
+                cash -= premium + commission
+                options_exposure += premium
+                positions.append({
+                    "ticker": ticker, "type": "straddle", "strategy": strategy,
+                    "strike": strike, "contracts": contracts,
+                    "premium_paid": premium, "current_value": premium,
+                    "entry_date": dt, "expiry": dt + timedelta(days=OPTION_DTE),
+                    "portfolio_at_entry": portfolio_val,
+                })
 
     # ── Close remaining positions at last price ────────────────────────────────
     for pos in positions:
         ticker  = pos["ticker"]
+        strategy = pos.get("strategy", "buy_call")
+        is_credit = strategy in ("bull_put_spread", "bear_call_spread", "iron_condor")
         df      = ticker_data[ticker]
         last_idx = len(df) - 1
         price   = float(df["Close"].iloc[last_idx])
@@ -434,12 +680,36 @@ def run_portfolio_backtest(
         T       = max((pos["expiry"] - last_dt).total_seconds() / (365 * 24 * 3600), 0)
         vol     = get_vol(df, last_idx, ticker, last_dt, earnings_dates, pos["entry_date"])
         spread  = get_spread(df, last_idx)
-        raw     = bs_call(price, pos["strike"], T, RISK_FREE_RATE, vol) if pos["type"] == "call" \
+
+        if is_credit:
+            credit = pos.get("credit_collected", pos["premium_paid"])
+            # Estimate close cost
+            if strategy == "bull_put_spread":
+                net = max(bs_put(price, pos["strike"], T, RISK_FREE_RATE, vol) -
+                          bs_put(price, pos["strike_buy"], T, RISK_FREE_RATE, vol), 0)
+            elif strategy == "bear_call_spread":
+                net = max(bs_call(price, pos["strike"], T, RISK_FREE_RATE, vol) -
+                          bs_call(price, pos["strike_buy"], T, RISK_FREE_RATE, vol), 0)
+            else:  # iron_condor
+                p_net = max(bs_put(price, pos["strike"], T, RISK_FREE_RATE, vol) -
+                            bs_put(price, pos["strike_buy"], T, RISK_FREE_RATE, vol), 0)
+                c_net = max(bs_call(price, pos["strike_sell_2"], T, RISK_FREE_RATE, vol) -
+                            bs_call(price, pos["strike_buy_2"], T, RISK_FREE_RATE, vol), 0)
+                net = p_net + c_net
+            close_cost = (net + spread) * pos["contracts"] * 100
+            payout = credit - close_cost
+        elif strategy == "buy_straddle":
+            call_val = bs_call(price, pos["strike"], T, RISK_FREE_RATE, vol)
+            put_val = bs_put(price, pos["strike"], T, RISK_FREE_RATE, vol)
+            payout = max(call_val + put_val - spread, 0) * pos["contracts"] * 100
+        else:
+            raw = bs_call(price, pos["strike"], T, RISK_FREE_RATE, vol) if pos["type"] == "call" \
                   else bs_put(price, pos["strike"], T, RISK_FREE_RATE, vol)
-        payout  = max(raw - spread, 0) * pos["contracts"] * 100
-        cash   += payout
+            payout = max(raw - spread, 0) * pos["contracts"] * 100
+
+        cash += payout
         trades_log.append({
-            "ticker": ticker, "type": pos["type"],
+            "ticker": ticker, "type": strategy,
             "entry_date": pos["entry_date"], "exit_date": last_dt,
             "pnl": payout - pos["premium_paid"],
             "premium_paid": pos["premium_paid"],

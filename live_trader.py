@@ -57,9 +57,17 @@ from config import (
     OPT_RSI_EXTREME_OB, OPT_RSI_EXTREME_OS,
     OPT_BB_PERIOD, OPT_BB_STD,
     OPT_MACD_FAST, OPT_MACD_SLOW, OPT_MACD_SIGNAL,
+    # Strategy engine
+    SPREAD_WIDTH, CONDOR_WING_WIDTH, DTE_SHORT, DTE_LONG, MIN_STRATEGY_SCORE,
 )
 from ib_broker import IBBroker
 from options_pricer import bs_call, bs_put, historical_vol
+from strategy_engine import (
+    detect_regime, select_strategy, rank_all_strategies,
+    STRATEGY_BUY_CALL, STRATEGY_BUY_PUT,
+    STRATEGY_BULL_PUT_SPREAD, STRATEGY_BEAR_CALL_SPREAD,
+    STRATEGY_IRON_CONDOR, STRATEGY_BUY_STRADDLE, STRATEGY_CALENDAR_SPREAD,
+)
 
 RISK_FREE_RATE  = 0.05
 IV_PREMIUM_MULT = 1.25   # implied vol ≈ 25 % above realized (matches backtest)
@@ -431,81 +439,332 @@ def save_options_positions(positions: dict):
         json.dump(positions, f, indent=2, default=str)
 
 
-def run_options_cycle(broker: IBBroker, account_value: float):
-    logger.info("--- OPTIONS CYCLE ---")
-    positions = load_options_positions()
-
-    # ── Step 1: manage existing options positions ─────────────────────────────
+def _manage_existing_positions(broker: IBBroker, positions: dict) -> float:
+    """Mark-to-market and close positions that hit exit criteria. Returns total exposure."""
     options_exposure = 0.0
 
     for key in list(positions.keys()):
         pos = positions[key]
         ticker   = pos["ticker"]
-        opt_type = pos["type"]           # "call" or "put"
-        right    = "C" if opt_type == "call" else "P"
+        strategy = pos.get("strategy", "buy_call")  # backward compat
 
         try:
-            from ib_insync import Option
-            contract = Option(
-                ticker, pos["expiry_str"], pos["strike"], right,
-                "SMART", currency="USD",
-            )
-            broker.ib.qualifyContracts(contract)
+            # For multi-leg positions, use net premium tracking
+            premium_paid = pos["premium_paid"]
+            days_to_expiry = (pd.Timestamp(pos["expiry_date"]) - pd.Timestamp.now()).days
 
-            mid = broker.get_option_mid_price(contract)
-            if mid <= 0.01:
-                # BS fallback for mark-to-market
-                df_u  = fetch_daily_bars(ticker, lookback_days=60)
-                prices = df_u["Close"].squeeze().values
-                vol    = historical_vol(prices, window=20) * IV_PREMIUM_MULT
-                days_left = (pd.Timestamp(pos["expiry_date"]) - pd.Timestamp.now()).days
-                T      = max(days_left / 365.0, 1e-6)
-                mid    = (bs_call(float(df_u["Close"].iloc[-1]), pos["strike"], T, RISK_FREE_RATE, vol)
-                          if opt_type == "call"
-                          else bs_put(float(df_u["Close"].iloc[-1]), pos["strike"], T, RISK_FREE_RATE, vol))
-                mid    = round(max(mid, 0.01), 2)
-            current_value = mid * pos["contracts"] * 100
-            pos["current_value"] = current_value
+            # Mark-to-market using primary leg
+            current_value = pos.get("current_value", premium_paid)
+            if "strike" in pos:
+                opt_type = pos.get("type", "call")
+                right = "C" if opt_type == "call" else "P"
+                from ib_insync import Option
+                contract = Option(
+                    ticker, pos["expiry_str"], pos["strike"], right,
+                    "SMART", currency="USD",
+                )
+                broker.ib.qualifyContracts(contract)
+                mid = broker.get_option_mid_price(contract)
+                if mid > 0.01:
+                    current_value = mid * pos["contracts"] * 100
+                else:
+                    df_u = fetch_daily_bars(ticker, lookback_days=60)
+                    prices = df_u["Close"].squeeze().values
+                    vol = historical_vol(prices, window=20) * IV_PREMIUM_MULT
+                    T = max(days_to_expiry / 365.0, 1e-6)
+                    mid = (bs_call(float(df_u["Close"].iloc[-1]), pos["strike"], T, RISK_FREE_RATE, vol)
+                           if opt_type == "call"
+                           else bs_put(float(df_u["Close"].iloc[-1]), pos["strike"], T, RISK_FREE_RATE, vol))
+                    current_value = max(mid, 0.01) * pos["contracts"] * 100
+                pos["current_value"] = current_value
 
-            days_to_expiry = (
-                pd.Timestamp(pos["expiry_date"]) - pd.Timestamp.now()
-            ).days
+            pnl_pct = (current_value - premium_paid) / premium_paid * 100 if premium_paid > 0 else 0
 
-            pnl_pct = (current_value - pos["premium_paid"]) / pos["premium_paid"] * 100
+            # For credit strategies, invert P&L logic (we want value to shrink)
+            is_credit = strategy in ("bull_put_spread", "bear_call_spread", "iron_condor")
+            if is_credit:
+                credit_collected = pos.get("credit_collected", premium_paid)
+                # For credit spreads: profit = credit - current_value_to_close
+                pnl_pct = (credit_collected - current_value) / credit_collected * 100 if credit_collected > 0 else 0
 
             logger.info(
-                f"  {ticker:>6} {opt_type:<4} | value=${current_value:>7.2f} | "
-                f"paid=${pos['premium_paid']:>7.2f} | P&L={pnl_pct:>+6.1f}% | DTE={days_to_expiry}"
+                f"  {ticker:>6} {strategy:<20} | value=${current_value:>7.2f} | "
+                f"cost=${premium_paid:>7.2f} | P&L={pnl_pct:>+6.1f}% | DTE={days_to_expiry}"
             )
 
             should_close = False
             close_reason = ""
 
-            if current_value <= pos["premium_paid"] * (1 - OPT_STOP_LOSS_PCT):
-                should_close = True
-                close_reason = f"stop-loss ({pnl_pct:.1f}%)"
-            elif current_value >= pos["premium_paid"] * (1 + OPT_TAKE_PROFIT_PCT):
-                should_close = True
-                close_reason = f"take-profit ({pnl_pct:.1f}%)"
-            elif days_to_expiry <= OPT_CLOSE_DTE:
+            if is_credit:
+                # Credit strategies: close when we've captured enough profit
+                if pnl_pct >= 50.0:  # captured 50% of max credit
+                    should_close = True
+                    close_reason = f"take-profit (captured {pnl_pct:.0f}% of credit)"
+                elif pnl_pct <= -100.0:  # losing more than the credit
+                    should_close = True
+                    close_reason = f"stop-loss ({pnl_pct:.0f}%)"
+            else:
+                # Debit strategies: same as before
+                if current_value <= premium_paid * (1 - OPT_STOP_LOSS_PCT):
+                    should_close = True
+                    close_reason = f"stop-loss ({pnl_pct:.1f}%)"
+                elif current_value >= premium_paid * (1 + OPT_TAKE_PROFIT_PCT):
+                    should_close = True
+                    close_reason = f"take-profit ({pnl_pct:.1f}%)"
+
+            if days_to_expiry <= OPT_CLOSE_DTE:
                 should_close = True
                 close_reason = f"near expiry (DTE={days_to_expiry})"
 
             if should_close:
-                logger.info(f"  >>> CLOSE {ticker} {opt_type} — {close_reason}")
-                sell_trade = broker.place_option_order(contract, pos["contracts"], "SELL")
-                if broker.wait_for_fill(sell_trade, timeout=30):
-                    del positions[key]
+                logger.info(f"  >>> CLOSE {ticker} {strategy} — {close_reason}")
+                # For single-leg, sell the contract
+                if "ib_conid" in pos and "strike" in pos:
+                    opt_type = pos.get("type", "call")
+                    right = "C" if opt_type == "call" else "P"
+                    from ib_insync import Option
+                    contract = Option(
+                        ticker, pos["expiry_str"], pos["strike"], right,
+                        "SMART", currency="USD",
+                    )
+                    broker.ib.qualifyContracts(contract)
+                    action = "SELL" if not is_credit else "BUY"  # close credit = buy back
+                    sell_trade = broker.place_option_order(contract, pos["contracts"], action)
+                    if broker.wait_for_fill(sell_trade, timeout=30):
+                        del positions[key]
+                    else:
+                        logger.warning(f"  {ticker}: close order not filled — keeping position")
                 else:
-                    logger.warning(f"  {ticker}: SELL order not filled — keeping position in JSON")
+                    # Multi-leg: just remove from tracking (combo close would need full rebuild)
+                    del positions[key]
             else:
-                options_exposure += current_value
+                options_exposure += abs(current_value)
 
         except Exception as exc:
             logger.error(f"  {ticker} options manage error: {exc}", exc_info=True)
-            options_exposure += pos.get("current_value", 0)
+            options_exposure += abs(pos.get("current_value", 0))
 
-    # ── Step 2: scan for new entry signals ────────────────────────────────────
+    return options_exposure
+
+
+def _execute_strategy(
+    broker: IBBroker, sel, ticker: str, positions: dict, options_exposure: float
+) -> float:
+    """Execute a strategy selection via the broker. Returns updated exposure."""
+    from strategy_engine import (
+        STRATEGY_BUY_CALL, STRATEGY_BUY_PUT,
+        STRATEGY_BULL_PUT_SPREAD, STRATEGY_BEAR_CALL_SPREAD,
+        STRATEGY_IRON_CONDOR, STRATEGY_BUY_STRADDLE, STRATEGY_CALENDAR_SPREAD,
+    )
+
+    price = sel.price
+    contracts = sel.contracts
+    strategy = sel.strategy
+
+    logger.info(
+        f"  >>> STRATEGY: {strategy} {ticker} | score={sel.score:.0f} | "
+        f"{sel.reason} | {contracts}x"
+    )
+
+    try:
+        if strategy in (STRATEGY_BUY_CALL, STRATEGY_BUY_PUT):
+            right = "C" if strategy == STRATEGY_BUY_CALL else "P"
+            contract = broker.get_atm_option_contract(
+                ticker, right, price, target_dte=sel.dte_near
+            )
+            if contract is None:
+                return options_exposure
+
+            mid = broker.get_option_mid_price(contract)
+            if mid <= 0.01:
+                mid = sel.estimated_debit + 0.15
+            if mid <= 0.01:
+                return options_exposure
+
+            logger.info(
+                f"  >>> OPEN {strategy} {ticker} | strike=${contract.strike} "
+                f"exp={contract.lastTradeDateOrContractMonth} | {contracts}x @ ${mid:.2f}"
+            )
+            trade = broker.place_option_order(contract, contracts, "BUY", limit_price=mid)
+            if not broker.wait_for_fill(trade, timeout=30):
+                logger.warning(f"  {ticker}: order not filled")
+                return options_exposure
+
+            avg_fill = trade.orderStatus.avgFillPrice or mid
+            actual_premium = round(avg_fill * contracts * 100, 2)
+            expiry_dt = datetime.strptime(contract.lastTradeDateOrContractMonth, "%Y%m%d")
+
+            pos_key = f"{ticker}_{strategy}"
+            positions[pos_key] = {
+                "ticker": ticker, "strategy": strategy,
+                "type": "call" if right == "C" else "put",
+                "contracts": contracts, "premium_paid": actual_premium,
+                "current_value": actual_premium,
+                "entry_date": datetime.now().isoformat(),
+                "expiry_date": expiry_dt.strftime("%Y-%m-%d"),
+                "expiry_str": contract.lastTradeDateOrContractMonth,
+                "strike": contract.strike, "ib_conid": contract.conId,
+            }
+            options_exposure += actual_premium
+
+        elif strategy in (STRATEGY_BULL_PUT_SPREAD, STRATEGY_BEAR_CALL_SPREAD):
+            right = "P" if strategy == STRATEGY_BULL_PUT_SPREAD else "C"
+            sell_contract = broker.get_atm_option_contract(
+                ticker, right, sel.strike_sell, target_dte=sel.dte_near
+            )
+            buy_contract = broker.get_atm_option_contract(
+                ticker, right, sel.strike_buy, target_dte=sel.dte_near
+            )
+            if sell_contract is None or buy_contract is None:
+                return options_exposure
+
+            net_credit = -abs(sel.estimated_credit)  # negative = credit
+            logger.info(
+                f"  >>> OPEN {strategy} {ticker} | sell ${sel.strike_sell} / buy ${sel.strike_buy} | "
+                f"{contracts}x | est credit=${sel.estimated_credit:.2f}"
+            )
+            trade = broker.place_spread_order(
+                ticker, sell_contract, buy_contract, contracts, net_price=net_credit
+            )
+            if not broker.wait_for_fill(trade, timeout=30):
+                logger.warning(f"  {ticker}: spread order not filled")
+                return options_exposure
+
+            expiry_dt = datetime.strptime(sell_contract.lastTradeDateOrContractMonth, "%Y%m%d")
+            pos_key = f"{ticker}_{strategy}"
+            positions[pos_key] = {
+                "ticker": ticker, "strategy": strategy,
+                "type": "put" if right == "P" else "call",
+                "contracts": contracts,
+                "premium_paid": round(sel.max_loss * contracts * 100, 2),
+                "credit_collected": round(sel.estimated_credit * contracts * 100, 2),
+                "current_value": round(sel.estimated_credit * contracts * 100, 2),
+                "entry_date": datetime.now().isoformat(),
+                "expiry_date": expiry_dt.strftime("%Y-%m-%d"),
+                "expiry_str": sell_contract.lastTradeDateOrContractMonth,
+                "strike": sel.strike_sell,
+                "strike_buy": sel.strike_buy,
+            }
+            options_exposure += sel.max_loss * contracts * 100
+
+        elif strategy == STRATEGY_IRON_CONDOR:
+            put_sell = broker.get_atm_option_contract(ticker, "P", sel.strike_sell, target_dte=sel.dte_near)
+            put_buy = broker.get_atm_option_contract(ticker, "P", sel.strike_buy, target_dte=sel.dte_near)
+            call_sell = broker.get_atm_option_contract(ticker, "C", sel.strike_sell_2, target_dte=sel.dte_near)
+            call_buy = broker.get_atm_option_contract(ticker, "C", sel.strike_buy_2, target_dte=sel.dte_near)
+            if not all([put_sell, put_buy, call_sell, call_buy]):
+                return options_exposure
+
+            net_credit = -abs(sel.estimated_credit)
+            logger.info(
+                f"  >>> OPEN iron_condor {ticker} | "
+                f"P${sel.strike_sell}/{sel.strike_buy} + C${sel.strike_sell_2}/{sel.strike_buy_2} | "
+                f"{contracts}x | est credit=${sel.estimated_credit:.2f}"
+            )
+            trade = broker.place_iron_condor(
+                ticker, put_sell, put_buy, call_sell, call_buy, contracts, net_price=net_credit
+            )
+            if not broker.wait_for_fill(trade, timeout=45):
+                logger.warning(f"  {ticker}: condor order not filled")
+                return options_exposure
+
+            expiry_dt = datetime.strptime(put_sell.lastTradeDateOrContractMonth, "%Y%m%d")
+            pos_key = f"{ticker}_iron_condor"
+            positions[pos_key] = {
+                "ticker": ticker, "strategy": strategy,
+                "type": "condor", "contracts": contracts,
+                "premium_paid": round(sel.max_loss * contracts * 100, 2),
+                "credit_collected": round(sel.estimated_credit * contracts * 100, 2),
+                "current_value": round(sel.estimated_credit * contracts * 100, 2),
+                "entry_date": datetime.now().isoformat(),
+                "expiry_date": expiry_dt.strftime("%Y-%m-%d"),
+                "expiry_str": put_sell.lastTradeDateOrContractMonth,
+                "strike": sel.strike_sell,
+                "strike_buy": sel.strike_buy,
+                "strike_sell_2": sel.strike_sell_2,
+                "strike_buy_2": sel.strike_buy_2,
+            }
+            options_exposure += sel.max_loss * contracts * 100
+
+        elif strategy == STRATEGY_BUY_STRADDLE:
+            call_contract = broker.get_atm_option_contract(ticker, "C", price, target_dte=sel.dte_near)
+            put_contract = broker.get_atm_option_contract(ticker, "P", price, target_dte=sel.dte_near)
+            if call_contract is None or put_contract is None:
+                return options_exposure
+
+            logger.info(
+                f"  >>> OPEN straddle {ticker} | strike=${sel.strike_buy} | "
+                f"{contracts}x | est debit=${sel.estimated_debit:.2f}"
+            )
+            trade = broker.place_straddle(
+                call_contract, put_contract, contracts,
+                net_price=round(sel.estimated_debit, 2),
+            )
+            if not broker.wait_for_fill(trade, timeout=30):
+                logger.warning(f"  {ticker}: straddle order not filled")
+                return options_exposure
+
+            expiry_dt = datetime.strptime(call_contract.lastTradeDateOrContractMonth, "%Y%m%d")
+            pos_key = f"{ticker}_straddle"
+            positions[pos_key] = {
+                "ticker": ticker, "strategy": strategy,
+                "type": "straddle", "contracts": contracts,
+                "premium_paid": round(sel.estimated_debit * contracts * 100, 2),
+                "current_value": round(sel.estimated_debit * contracts * 100, 2),
+                "entry_date": datetime.now().isoformat(),
+                "expiry_date": expiry_dt.strftime("%Y-%m-%d"),
+                "expiry_str": call_contract.lastTradeDateOrContractMonth,
+                "strike": sel.strike_buy,
+            }
+            options_exposure += sel.estimated_debit * contracts * 100
+
+        elif strategy == STRATEGY_CALENDAR_SPREAD:
+            sell_near = broker.get_atm_option_contract(ticker, "C", price, target_dte=sel.dte_near)
+            buy_far = broker.get_atm_option_contract(ticker, "C", price, target_dte=sel.dte_far)
+            if sell_near is None or buy_far is None:
+                return options_exposure
+
+            logger.info(
+                f"  >>> OPEN calendar {ticker} | strike=${sel.strike_buy} | "
+                f"sell DTE={sel.dte_near} / buy DTE={sel.dte_far} | "
+                f"{contracts}x | est debit=${sel.estimated_debit:.2f}"
+            )
+            trade = broker.place_calendar_spread(
+                ticker, sell_near, buy_far, contracts,
+                net_price=round(sel.estimated_debit, 2),
+            )
+            if not broker.wait_for_fill(trade, timeout=30):
+                logger.warning(f"  {ticker}: calendar order not filled")
+                return options_exposure
+
+            expiry_dt = datetime.strptime(buy_far.lastTradeDateOrContractMonth, "%Y%m%d")
+            pos_key = f"{ticker}_calendar"
+            positions[pos_key] = {
+                "ticker": ticker, "strategy": strategy,
+                "type": "calendar", "contracts": contracts,
+                "premium_paid": round(sel.estimated_debit * contracts * 100, 2),
+                "current_value": round(sel.estimated_debit * contracts * 100, 2),
+                "entry_date": datetime.now().isoformat(),
+                "expiry_date": expiry_dt.strftime("%Y-%m-%d"),
+                "expiry_str": buy_far.lastTradeDateOrContractMonth,
+                "strike": sel.strike_buy,
+            }
+            options_exposure += sel.estimated_debit * contracts * 100
+
+    except Exception as exc:
+        logger.error(f"  {ticker} {strategy} execution error: {exc}", exc_info=True)
+
+    return options_exposure
+
+
+def run_options_cycle(broker: IBBroker, account_value: float):
+    logger.info("--- OPTIONS CYCLE (ADAPTIVE STRATEGY ENGINE) ---")
+    positions = load_options_positions()
+
+    # ── Step 1: manage existing positions ─────────────────────────────────────
+    options_exposure = _manage_existing_positions(broker, positions)
+
+    # ── Step 2: scan universe and select optimal strategy per ticker ──────────
     max_total_exp = account_value * OPT_MAX_TOTAL_PCT
 
     for ticker in OPTIONS_TICKERS:
@@ -513,102 +772,58 @@ def run_options_cycle(broker: IBBroker, account_value: float):
             logger.info(f"  Max options exposure reached (${options_exposure:.0f}), stopping scan")
             break
 
-        # Skip if already holding a position in this ticker
-        if f"{ticker}_call" in positions or f"{ticker}_put" in positions:
+        # Skip if already holding any position in this ticker
+        if any(k.startswith(ticker + "_") for k in positions):
             continue
 
         try:
-            df = fetch_daily_bars(ticker, lookback_days=80)
+            df = fetch_daily_bars(ticker, lookback_days=260)  # ~1 year for IV rank
             if len(df) < OPT_EMA_SLOW + OPT_RSI_PERIOD + 5:
-                continue
-
-            sig    = compute_options_signal(df)
-            signal = sig["signal"]
-            price  = sig["price"]
-
-            if signal is None:
                 continue
 
             # Earnings blackout
             if is_near_earnings(ticker):
-                logger.info(f"  {ticker}: near earnings — skipping")
                 continue
 
-            opt_type = signal.lower()   # "call" or "put"
-            right    = "C" if signal == "CALL" else "P"
-            pos_key  = f"{ticker}_{opt_type}"
+            # Compute signals
+            sig = compute_options_signal(df)
 
-            logger.info(
-                f"  {ticker:>6} {opt_type:<4} SIGNAL ({sig['reason']}) | "
-                f"${price:.2f} | RSI={sig['rsi']:.1f} | "
-                f"EMA{OPT_EMA_FAST}={sig['ema_fast']:.2f} | EMA{OPT_EMA_SLOW}={sig['ema_slow']:.2f}"
+            # Detect market regime
+            df.attrs["ticker"] = ticker
+            regime = detect_regime(df, sig, iv_premium_mult=IV_PREMIUM_MULT)
+
+            # Select optimal strategy
+            sel = select_strategy(
+                regime,
+                account_value=account_value,
+                max_trade_pct=OPT_MAX_TRADE_PCT,
+                spread_width=SPREAD_WIDTH,
+                condor_wing_width=CONDOR_WING_WIDTH,
+                dte_short=DTE_SHORT,
+                dte_long=DTE_LONG,
+                r=RISK_FREE_RATE,
+                min_score=MIN_STRATEGY_SCORE,
             )
 
-            # Find ATM contract
-            contract = broker.get_atm_option_contract(ticker, right, price, target_dte=OPT_DTE)
-            if contract is None:
+            if sel is None:
                 continue
 
-            # Get mid price — fall back to Black-Scholes if no market data subscription
-            mid = broker.get_option_mid_price(contract)
-            if mid <= 0.01:
-                prices = df["Close"].squeeze().values
-                vol    = historical_vol(prices, window=20) * IV_PREMIUM_MULT
-                T      = OPT_DTE / 365.0
-                mid    = (bs_call(price, contract.strike, T, RISK_FREE_RATE, vol)
-                          if signal == "CALL"
-                          else bs_put(price, contract.strike, T, RISK_FREE_RATE, vol))
-                mid   += 0.15   # add base bid/ask half-spread
-                mid    = round(mid, 2)
-                logger.info(f"  {ticker}: IB quote unavailable — BS fallback ${mid:.2f} (vol={vol:.1%})")
-                if mid <= 0.01:
-                    continue
-
-            # Position sizing: 2 % of account, respect remaining headroom
-            max_premium    = min(account_value * OPT_MAX_TRADE_PCT, max_total_exp - options_exposure)
-            num_contracts  = max(1, int(max_premium / (mid * 100)))
-            premium        = round(mid * num_contracts * 100, 2)
-            commission     = round(num_contracts * OPT_COMMISSION, 2)
-
-            if premium + commission > account_value * OPT_MAX_TRADE_PCT * 1.05:
-                num_contracts = 1
-                premium       = round(mid * 100, 2)
-                commission    = OPT_COMMISSION
-
+            # Log the decision
+            rankings = rank_all_strategies(regime)
+            top3 = ", ".join(f"{r['strategy']}={r['score']}" for r in rankings[:3])
             logger.info(
-                f"  >>> OPEN {opt_type.upper()} {ticker} | "
-                f"strike=${contract.strike} exp={contract.lastTradeDateOrContractMonth} | "
-                f"{num_contracts}x @ ${mid:.2f} | total=${premium:.2f} + ${commission:.2f} comm"
+                f"  {ticker:>6} | dir={regime.direction} str={regime.strength} "
+                f"IVR={regime.iv_rank:.0f} IV/HV={regime.iv_hv_ratio:.2f} RSI={regime.rsi:.0f} | "
+                f"top3: [{top3}]"
             )
 
-            trade = broker.place_option_order(contract, num_contracts, "BUY", limit_price=mid)
-
-            if not broker.wait_for_fill(trade, timeout=30):
-                logger.warning(f"  {ticker}: BUY order not filled within 30s — not recording position")
-                continue
-
-            # Use actual fill price, not estimated mid
-            avg_fill = trade.orderStatus.avgFillPrice or mid
-            actual_premium = round(avg_fill * num_contracts * 100, 2)
-            logger.info(f"  {ticker}: filled @ ${avg_fill:.2f} — premium=${actual_premium:.2f}")
-
-            expiry_dt = datetime.strptime(contract.lastTradeDateOrContractMonth, "%Y%m%d")
-            positions[pos_key] = {
-                "ticker":        ticker,
-                "type":          opt_type,
-                "contracts":     num_contracts,
-                "premium_paid":  actual_premium,
-                "current_value": actual_premium,
-                "entry_date":    datetime.now().isoformat(),
-                "expiry_date":   expiry_dt.strftime("%Y-%m-%d"),
-                "expiry_str":    contract.lastTradeDateOrContractMonth,
-                "strike":        contract.strike,
-                "ib_conid":      contract.conId,
-            }
-            options_exposure += actual_premium
+            # Execute the chosen strategy
+            options_exposure = _execute_strategy(
+                broker, sel, ticker, positions, options_exposure
+            )
 
         except Exception as exc:
-            logger.error(f"  {ticker} options entry error: {exc}", exc_info=True)
+            logger.error(f"  {ticker} strategy error: {exc}", exc_info=True)
 
     save_options_positions(positions)
     open_count = len(positions)
